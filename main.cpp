@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <devguid.h>
 #include <setupapi.h>
 #include <iostream>
 #include <string>
