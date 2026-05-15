@@ -1,0 +1,15 @@
+name: Build-EXE
+on: [push]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Compilar
+        run: |
+          cl.exe /EHsc main.cpp /Fe:MandoShield.exe advapi32.lib setupapi.lib user32.lib
+      - name: Upload
+        uses: actions/upload-artifact@v3
+        with:
+          name: MandoShield-Win7
+          path: MandoShield.exe
