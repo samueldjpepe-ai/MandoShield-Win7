@@ -8,76 +8,16 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// Variables globales para limpieza
+struct MandoInfo {
+    std::wstring name;
+    std::wstring hwID;
+};
+
 std::wstring g_pidPath = L"";
 
-// 1. Verifica si el driver HidGuardian está configurado como filtro de clase
-bool IsFilterActive() {
-    HKEY hKey;
-    LPCWSTR path = L"SYSTEM\\CurrentControlSet\\Control\\Class\\{745a17a0-74d3-11d0-b6fe-00a0c90f57da}";
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        DWORD size = 0;
-        if (RegQueryValueExW(hKey, L"UpperFilters", NULL, NULL, NULL, &size) == ERROR_SUCCESS) {
-            std::vector<wchar_t> buffer(size / sizeof(wchar_t));
-            if (RegQueryValueExW(hKey, L"UpperFilters", NULL, NULL, (LPBYTE)buffer.data(), &size) == ERROR_SUCCESS) {
-                std::wstring filters(buffer.data(), size / sizeof(wchar_t));
-                RegCloseKey(hKey);
-                return (filters.find(L"HidGuardian") != std::wstring::npos);
-            }
-        }
-        RegCloseKey(hKey);
-    }
-    return false;
-}
+// --- FUNCIONES DE APOYO ---
 
-// 2. Agrega el ID del mando a la lista de bloqueados y el proceso actual a la lista blanca
-bool ForceBlock(std::wstring hardwareID) {
-    HKEY hKey;
-    LPCWSTR path = L"SYSTEM\\CurrentControlSet\\Services\\HidGuardian\\Parameters";
-    
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &hKey) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    // Escribir AffectedDevices (REG_MULTI_SZ requiere doble nulo al final)
-    std::vector<wchar_t> data(hardwareID.begin(), hardwareID.end());
-    data.push_back(L'\0'); 
-    data.push_back(L'\0'); 
-
-    if (RegSetValueExW(hKey, L"AffectedDevices", 0, REG_MULTI_SZ, 
-                       (BYTE*)data.data(), (DWORD)(data.size() * sizeof(wchar_t))) != ERROR_SUCCESS) {
-        RegCloseKey(hKey);
-        return false;
-    }
-
-    // Whitelist basada en nuestro PID
-    g_pidPath = L"Whitelist\\" + std::to_wstring(GetCurrentProcessId());
-    HKEY hWhite;
-    if (RegCreateKeyExW(hKey, g_pidPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hWhite, NULL) == ERROR_SUCCESS) {
-        RegCloseKey(hWhite);
-    }
-
-    RegCloseKey(hKey);
-    return true;
-}
-
-// 3. Reinicia los dispositivos HID para que el driver intercepte el mando
-void RestartHID() {
-    HDEVINFO hDevInfo = SetupDiGetClassDevsW(NULL, L"HID", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (hDevInfo == INVALID_HANDLE_VALUE) return;
-
-    SP_DEVINFO_DATA devData = { sizeof(SP_DEVINFO_DATA) };
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devData); i++) {
-        SP_PROPCHANGE_PARAMS pcp = { {sizeof(SP_CLASSINSTALL_HEADER), DIF_PROPERTYCHANGE}, DICS_PROPCHANGE, DICS_FLAG_GLOBAL, 0 };
-        
-        if (SetupDiSetClassInstallParamsW(hDevInfo, &devData, &pcp.ClassInstallHeader, sizeof(pcp))) {
-            SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, &devData);
-        }
-    }
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-}
-
-// Función de limpieza al salir
+// Limpieza de la lista blanca al salir
 void Cleanup(int signum) {
     if (!g_pidPath.empty()) {
         HKEY hKey;
@@ -85,43 +25,124 @@ void Cleanup(int signum) {
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
             RegDeleteKeyW(hKey, g_pidPath.c_str());
             RegCloseKey(hKey);
-            std::cout << "\n[INFO] Limpieza de Whitelist completada.\n";
+            std::cout << "\n[INFO] Whitelist limpiada. Saliendo...\n";
         }
     }
     exit(signum);
 }
 
+// 1. Detectar mandos conectados
+std::vector<MandoInfo> ListarMandos() {
+    std::vector<MandoInfo> lista;
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_HIDCLASS, NULL, NULL, DIGCF_PRESENT);
+    if (hDevInfo == INVALID_HANDLE_VALUE) return lista;
+
+    SP_DEVINFO_DATA devData = { sizeof(SP_DEVINFO_DATA) };
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devData); i++) {
+        wchar_t buffer[512];
+        MandoInfo mando;
+
+        // Intentar obtener el nombre amigable o la descripción
+        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_FRIENDLYNAME, NULL, (PBYTE)buffer, sizeof(buffer), NULL) ||
+            SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_DEVICEDESC, NULL, (PBYTE)buffer, sizeof(buffer), NULL)) {
+            mando.name = buffer;
+        } else {
+            mando.name = L"Dispositivo desconocido";
+        }
+
+        // Obtener el Hardware ID (usamos el primero de la lista que devuelve el sistema)
+        if (SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devData, SPDRP_HARDWAREID, NULL, (PBYTE)buffer, sizeof(buffer), NULL)) {
+            mando.hwID = buffer;
+            // Filtrar: solo añadir si parece un mando (VID/PID) y no es un componente virtual
+            if (mando.hwID.find(L"VID_") != std::wstring::npos) {
+                lista.push_back(mando);
+            }
+        }
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return lista;
+}
+
+// 2. Bloquear mando seleccionado
+bool BloquearMando(std::wstring hardwareID) {
+    HKEY hKey;
+    LPCWSTR path = L"SYSTEM\\CurrentControlSet\\Services\\HidGuardian\\Parameters";
+    
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &hKey) != ERROR_SUCCESS) return false;
+
+    // REG_MULTI_SZ: ID + doble nulo
+    std::vector<wchar_t> data(hardwareID.begin(), hardwareID.end());
+    data.push_back(L'\0'); 
+    data.push_back(L'\0'); 
+
+    RegSetValueExW(hKey, L"AffectedDevices", 0, REG_MULTI_SZ, (BYTE*)data.data(), (DWORD)(data.size() * sizeof(wchar_t)));
+
+    // Whitelist PID
+    g_pidPath = L"Whitelist\\" + std::to_wstring(GetCurrentProcessId());
+    HKEY hWhite;
+    RegCreateKeyExW(hKey, g_pidPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hWhite, NULL);
+    RegCloseKey(hWhite);
+
+    RegCloseKey(hKey);
+    return true;
+}
+
+// 3. Reiniciar HID
+void ReiniciarHID() {
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_HIDCLASS, NULL, NULL, DIGCF_PRESENT);
+    SP_DEVINFO_DATA devData = { sizeof(SP_DEVINFO_DATA) };
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devData); i++) {
+        SP_PROPCHANGE_PARAMS pcp = { {sizeof(SP_CLASSINSTALL_HEADER), DIF_PROPERTYCHANGE}, DICS_PROPCHANGE, DICS_FLAG_GLOBAL, 0 };
+        if (SetupDiSetClassInstallParamsW(hDevInfo, &devData, &pcp.ClassInstallHeader, sizeof(pcp))) {
+            SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, &devData);
+        }
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+}
+
+// --- MAIN ---
+
 int main() {
-    // Configurar señales de salida para limpiar el registro
     signal(SIGINT, Cleanup);
-    signal(SIGTERM, Cleanup);
+    _wsetlocale(LC_ALL, L""); // Soporte para caracteres especiales
 
-    std::cout << "====================================\n";
-    std::cout << "      MandoShield - HidGuardian     \n";
-    std::cout << "====================================\n\n";
+    std::cout << "======================================\n";
+    std::cout << "      MandoShield: Selector HID       \n";
+    std::cout << "======================================\n\n";
 
-    if (!IsFilterActive()) {
-        std::cout << "[!] ERROR: HidGuardian NO esta configurado como Filtro de Clase.\n";
-        std::cout << "Ejecuta esto en PowerShell como Admin primero:\n";
-        std::cout << "devcon classfilter HIDClass upper -HidGuardian\n\n";
+    std::cout << "[*] Escaneando mandos conectados...\n";
+    std::vector<MandoInfo> mandos = ListarMandos();
+
+    if (mandos.empty()) {
+        std::cout << "[!] No se detectaron mandos HID.\n";
         system("pause");
-        return 1;
+        return 0;
     }
 
-    // ID de hardware del mando (Cambia esto por el tuyo si es necesario)
-    std::wstring miMando = L"HID\\VID_0079&PID_0006";
+    for (size_t i = 0; i < mandos.size(); i++) {
+        std::wcout << i + 1 << L". " << mandos[i].name << L"\n";
+        std::wcout << L"   ID: " << mandos[i].hwID << L"\n\n";
+    }
 
-    std::cout << "[*] Intentando bloquear mando: " << std::string(miMando.begin(), miMando.end()) << "...\n";
+    int seleccion;
+    std::cout << "Seleccione el numero de mando a BLOQUEAR (0 para cancelar): ";
+    std::cin >> seleccion;
 
-    if (ForceBlock(miMando)) {
-        std::cout << "[*] Reiniciando pila HID (la pantalla/mouse pueden parpadear)...\n";
-        RestartHID();
-        std::cout << "[OK] Mando ocultado exitosamente.\n";
-        std::cout << "[!] NO CIERRES esta ventana. Presiona Ctrl+C para salir y desbloquear.\n";
+    if (seleccion > 0 && seleccion <= (int)mandos.size()) {
+        std::wstring idSeleccionado = mandos[seleccion - 1].hwID;
         
-        while (true) Sleep(1000);
+        std::cout << "[*] Aplicando bloqueo...\n";
+        if (BloquearMando(idSeleccionado)) {
+            ReiniciarHID();
+            std::cout << "\n[OK] Mando bloqueado exitosamente.\n";
+            std::cout << "[!] No cierres esta ventana para mantener el acceso.\n";
+            std::cout << "[!] Presiona Ctrl+C para salir y liberar el mando.\n";
+            while (true) Sleep(1000);
+        } else {
+            std::cout << "[!] ERROR: Revisa si eres Administrador.\n";
+        }
     } else {
-        std::cout << "[!] ERROR: No se pudo escribir en el registro. ¿Ejecutaste como Administrador?\n";
+        std::cout << "Operacion cancelada.\n";
     }
 
     system("pause");
