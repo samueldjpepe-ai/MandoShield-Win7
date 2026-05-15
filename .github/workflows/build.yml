@@ -1,15 +1,22 @@
-name: Build-EXE
+name: Build-MandoShield
 on: [push]
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-latest # Usa el entorno más reciente de Windows para compilar
     steps:
-      - uses: actions/checkout@v3
-      - name: Compilar
+      - name: Descargar Codigo
+        uses: actions/checkout@v4 # Actualizado a v4
+
+      - name: Configurar Compilador MSVC
+        uses: ilammy/msvc-dev-cmd@v1 # Prepara el entorno para cl.exe
+
+      - name: Compilar EXE
         run: |
           cl.exe /EHsc main.cpp /Fe:MandoShield.exe advapi32.lib setupapi.lib user32.lib
-      - name: Upload
-        uses: actions/upload-artifact@v3
+
+      - name: Subir Ejecutable Final
+        uses: actions/upload-artifact@v4 # FIX: Actualizado a v4 para evitar el error de la imagen
         with:
-          name: MandoShield-Win7
+          name: MandoShield-Win7-Artifact
           path: MandoShield.exe
