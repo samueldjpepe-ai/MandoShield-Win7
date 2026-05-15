@@ -7,37 +7,43 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// Función para configurar las llaves de registro de HidGuardian
 void ConfigurarHidGuardian(std::wstring hardwareID) {
     HKEY hKey;
-    // La ruta base de HidGuardian Gen1 [1]
+    // Ruta de configuración de HidGuardian Gen1
     std::wstring base = L"SYSTEM\\CurrentControlSet\\Services\\HidGuardian\\Parameters";
     
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, base.c_str(), 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
-        // 1. Whitelist: Crear subclave con el PID actual [5]
+        // 1. Whitelist: Se crea una subclave con el PID del proceso actual
         DWORD pid = GetCurrentProcessId();
         HKEY hWhitelist;
         std::wstring pidPath = L"Whitelist\\" + std::to_wstring(pid);
-        RegCreateKeyExW(hKey, pidPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hWhitelist, NULL);
-        RegCloseKey(hWhitelist);
+        if (RegCreateKeyExW(hKey, pidPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hWhitelist, NULL) == ERROR_SUCCESS) {
+            RegCloseKey(hWhitelist);
+        }
 
-        // 2. AffectedDevices: Escribir el ID del mando como REG_MULTI_SZ [5, 6]
+        // 2. AffectedDevices: Se define el Hardware ID del mando a ocultar (formato REG_MULTI_SZ)
+        // Se añade un doble nulo al final para cumplir con el formato de cadena múltiple
         std::wstring data = hardwareID + L"\0"; 
         RegSetValueExW(hKey, L"AffectedDevices", 0, REG_MULTI_SZ, (BYTE*)data.c_str(), (data.length() + 1) * sizeof(wchar_t));
         
         RegCloseKey(hKey);
-        std::wcout << L"Configurado para bloquear: " << hardwareID << std::endl;
+        std::wcout << L"[OK] Mando configurado en HidGuardian: " << hardwareID << std::endl;
+    } else {
+        std::cout << " No se pudo abrir el registro. ¿Ejecuto como Administrador?" << std::endl;
     }
 }
 
-void ReiniciarDispositivos() {
-    // Forzar re-enumeración mediante SetupAPI [3, 7, 4]
+// Función para forzar que Windows reconozca los cambios sin reiniciar la PC
+void ReiniciarDispositivosHID() {
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(NULL, L"HID", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (hDevInfo == INVALID_HANDLE_VALUE) return;
+
     SP_DEVINFO_DATA devData = { sizeof(SP_DEVINFO_DATA) };
-    
     for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devData); i++) {
         SP_PROPCHANGE_PARAMS pcp = { sizeof(SP_CLASSINSTALL_HEADER) };
         pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-        pcp.StateChange = DICS_PROPCHANGE; // Valor para resetear el dispositivo [4]
+        pcp.StateChange = DICS_PROPCHANGE; // Forzar cambio de propiedad para reiniciar el nodo
         pcp.Scope = DICS_FLAG_CONFIGSPECIFIC;
         
         if (SetupDiSetClassInstallParamsW(hDevInfo, &devData, &pcp.ClassInstallHeader, sizeof(pcp))) {
@@ -45,17 +51,21 @@ void ReiniciarDispositivos() {
         }
     }
     SetupDiDestroyDeviceInfoList(hDevInfo);
+    std::cout << "[INFO] Bus de dispositivos HID reiniciado." << std::endl;
 }
 
 int main() {
-    std::cout << "MandoShield v1.0 - Win7\n";
-    // Hardware ID de ejemplo (puedes pedirlo por consola)
+    std::cout << "========================================" << std::endl;
+    std::cout << "   MandoShield v1.1 - Windows 7 Fix" << std::endl;
+    std::cout << "========================================\n" << std::endl;
+
+    // ID de Hardware de ejemplo (ID común de mandos genéricos)
     std::wstring mandoId = L"HID\\VID_0079&PID_0006"; 
 
     ConfigurarHidGuardian(mandoId);
-    ReiniciarDispositivos();
+    ReiniciarDispositivosHID();
 
-    std::cout << "Proceso completado. Ejecute como Administrador para exito.\n";
+    std::cout << "\nProceso terminado. Ya puede iniciar su juego." << std::endl;
     system("pause");
     return 0;
 }
