@@ -7,7 +7,7 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
-#include <fstream> // Añadido para manejo de archivo de configuración
+#include <fstream> // <- Nueva librería para manejo de archivos
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -24,9 +24,8 @@ struct ProcesoInfo {
 
 std::vector<std::wstring> g_bloqueados;
 std::vector<DWORD> g_whitelistPIDs;
-std::wstring g_exeTarget = L""; // Guarda el nombre del ejecutable de la configuración
-
-const std::string CONFIG_FILE = "MandoShield.cfg";
+std::wstring g_exeWhitelistNombre = L""; // Guarda el nombre del exe para persistencia
+const std::string CONFIG_FILE = "config_mando.txt"; // Archivo de configuración
 
 // --- FUNCIONES DE PROCESOS ---
 
@@ -51,56 +50,15 @@ std::vector<ProcesoInfo> ListarProcesosUsuario() {
     return lista;
 }
 
-// Busca el PID en tiempo real de un ejecutable por su nombre (.exe)
-DWORD ObtenerPIDPorNombre(const std::wstring& nombreExe) {
-    if (nombreExe.empty()) return 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(hSnap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, nombreExe.c_str()) == 0) {
-                    CloseHandle(hSnap);
-                    return pe.th32ProcessID;
-                }
-            } while (Process32NextW(hSnap, &pe));
+// Busca el PID actual de un proceso por su nombre .exe
+DWORD ObtenerPidPorNombre(const std::wstring& nombreExe) {
+    auto procesos = ListarProcesosUsuario();
+    for (const auto& p : procesos) {
+        if (_wcsicmp(p.nombre.c_str(), nombreExe.c_str()) == 0) {
+            return p.pid;
         }
-        CloseHandle(hSnap);
     }
     return 0;
-}
-
-// --- GESTIÓN DE CONFIGURACIÓN (.CFG) ---
-
-void GuardarConfiguracionArchivo() {
-    std::wofstream archivo(CONFIG_FILE);
-    if (archivo.is_open()) {
-        archivo << g_exeTarget << L"\n";
-        for (const auto& id : g_bloqueados) {
-            archivo << id << L"\n";
-        }
-        archivo.close();
-    }
-}
-
-bool CargarConfiguracionArchivo() {
-    std::wifstream archivo(CONFIG_FILE);
-    if (!archivo.is_open()) return false;
-
-    g_bloqueados.clear();
-    if (std::getline(archivo, g_exeTarget)) {
-        std::wstring linea;
-        while (std::getline(archivo, linea)) {
-            if (!linea.empty()) {
-                g_bloqueados.push_back(linea);
-            }
-        }
-        archivo.close();
-        return true;
-    }
-    archivo.close();
-    return false;
 }
 
 // --- GESTIÓN DE REGISTRO ---
@@ -110,32 +68,19 @@ bool AplicarCambios() {
     LPCWSTR path = L"SYSTEM\\CurrentControlSet\\Services\\HidGuardian\\Parameters";
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &hKey) != ERROR_SUCCESS) return false;
 
-    // 1. AffectedDevices (Multi-SZ)
     std::vector<wchar_t> multiSz;
     for (const auto& id : g_bloqueados) {
         for (wchar_t c : id) multiSz.push_back(c);
         multiSz.push_back(L'\0');
     }
-    multiSz.push_back(L'\0'); // Doble nulo final
+    multiSz.push_back(L'\0'); 
     RegSetValueExW(hKey, L"AffectedDevices", 0, REG_MULTI_SZ, (BYTE*)multiSz.data(), (DWORD)(multiSz.size() * sizeof(wchar_t)));
 
-    // 2. Limpiar Whitelist antigua (opcional)
-    HKEY hKeyWhitelist;
-    if (RegOpenKeyExW(hKey, L"Whitelist", 0, KEY_ALL_ACCESS, &hKeyWhitelist) == ERROR_SUCCESS) {
-        wchar_t subKeyName[256];
-        DWORD nameSize = 256;
-        while (RegEnumKeyExW(hKeyWhitelist, 0, subKeyName, &nameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            RegDeleteKeyW(hKeyWhitelist, subKeyName);
-            nameSize = 256;
-        }
-        RegCloseKey(hKeyWhitelist);
-    }
-
-    // 3. Escribir Whitelist nueva (incluyendo el PID propio)
     std::vector<DWORD> pidsTemp = g_whitelistPIDs;
     pidsTemp.push_back(GetCurrentProcessId());
 
     for (DWORD pid : pidsTemp) {
+        if (pid == 0) continue; // Evitar PIDs inválidos
         std::wstring p = L"Whitelist\\" + std::to_wstring(pid);
         HKEY hSubKey;
         if (RegCreateKeyExW(hKey, p.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hSubKey, NULL) == ERROR_SUCCESS) {
@@ -187,52 +132,96 @@ std::vector<MandoInfo> ListarMandos() {
     return lista;
 }
 
+// --- AUTOMATIZACIÓN: GUARDAR Y CARGAR ---
+
+void GuardarConfiguracion() {
+    std::wofstream archivo(CONFIG_FILE);
+    if (archivo.is_open()) {
+        // Primera línea: Nombre del ejecutable de la whitelist
+        archivo << g_exeWhitelistNombre << L"\n";
+        // Siguientes líneas: IDs de los mandos bloqueados
+        for (const auto& id : g_bloqueados) {
+            archivo << id << L"\n";
+        }
+        archivo.close();
+        std::wcout << L"\n[OK] Configuración guardada automáticamente en '" << CONFIG_FILE.c_str() << L"'.\n";
+    } else {
+        std::wcout << L"\n[!] Error al crear el archivo de configuración.\n";
+    }
+}
+
+bool CargarConfiguracion() {
+    std::wifstream archivo(CONFIG_FILE);
+    if (!archivo.is_open()) return false;
+
+    g_bloqueados.clear();
+    g_whitelistPIDs.clear();
+
+    if (std::getline(archivo, g_exeWhitelistNombre)) {
+        // Buscar el PID dinámico del ejecutable guardado
+        if (!g_exeWhitelistNombre.empty() && g_exeWhitelistNombre != L"OMITIDO") {
+            DWORD pidActual = ObtenerPidPorNombre(g_exeWhitelistNombre);
+            if (pidActual != 0) {
+                g_whitelistPIDs.push_back(pidActual);
+                std::wcout << L"[OK] Whitelist cargada: " << g_exeWhitelistNombre << L" (PID Actual: " << pidActual << L")\n";
+            } else {
+                std::wcout << L"[WARN] El proceso '" << g_exeWhitelistNombre << L"' está guardado pero no se encuentra abierto ahora.\n";
+            }
+        }
+    }
+
+    std::wstring lineaId;
+    while (std::getline(archivo, lineaId)) {
+        if (!lineaId.empty()) {
+            g_bloqueados.push_back(lineaId);
+        }
+    }
+    archivo.close();
+    return true;
+}
+
 // --- MAIN ---
 
 int main() {
     _wsetlocale(LC_ALL, L"");
-    bool usarConfigPrevia = false;
 
-    // COMPROBACIÓN INICIAL DEL ARCHIVO .CFG
-    if (CargarConfiguracionArchivo()) {
-        std::wcout << L"==================================================\n";
-        std::wcout << L"[*] SE DETECTO UNA CONFIGURACION PREVIA:\n";
-        std::wcout << L"    - Ejecutable Whitelist: " << g_exeTarget << L"\n";
-        std::wcout << L"    - Cantidad de mandos en plantilla: " << g_bloqueados.size() << L"\n";
-        std::wcout << L"==================================================\n";
-        std::wcout << L"[0] Mantener y aplicar configuracion previa\n";
-        std::wcout << L"[1] Configurar de nuevo (Asistente manual)\n";
-        std::wcout << L"Seleccion: ";
-        
-        int opcion;
-        if (std::wcin >> opcion && opcion == 0) {
-            usarConfigPrevia = true;
+    bool omitirConfiguracion = false;
+    std::wifstream checkFile(CONFIG_FILE);
+    
+    // Verificar si ya existe una configuración previa
+    if (checkFile.good()) {
+        checkFile.close();
+        std::wcout << L"=== SE DETECTÓ CONFIGURACIÓN PREVIA ===\n";
+        std::wcout << L"[0] Ejecutar lo guardado\n";
+        std::wcout << L"[1] Configurar de nuevo\n";
+        std::wcout << L"Selección: ";
+        int opc;
+        if (std::wcin >> opc && opc == 0) {
+            std::wcout << L"\nCargando configuración...\n";
+            if (CargarConfiguracion()) {
+                omitirConfiguracion = true;
+                // Aplicar los cambios directamente sin modificar el archivo
+                if (AplicarCambios()) {
+                    ReiniciarHID();
+                    std::wcout << L"[OK] Todo aplicado correctamente desde el archivo.\n";
+                } else {
+                    std::wcout << L"[!] ERROR: No se pudo escribir en el registro. ¿Eres Administrador?\n";
+                }
+                Sleep(2000);
+            } else {
+                std::wcout << L"[!] Error leyendo el archivo. Iniciando modo configuración...\n";
+                Sleep(1500);
+            }
         }
-        std::wcin.clear();
-        std::wcin.ignore(10000, L'\n');
+    } else {
+        checkFile.close();
     }
 
-    if (usarConfigPrevia) {
-        // Buscar el PID actual en ejecución del ejecutable que estaba guardado
-        DWORD pidActual = ObtenerPIDPorNombre(g_exeTarget);
-        if (pidActual != 0) {
-            g_whitelistPIDs.push_back(pidActual);
-            std::wcout << L"\n[OK] Enlazado automaticamente a " << g_exeTarget << L" (PID: " << pidActual << L")\n";
-        } else {
-            std::wcout << L"\n[!] AVISO: " << g_exeTarget << L" no esta abierto ahora mismo.\n";
-            std::wcout << L"    La whitelist se aplicara dinamicamente cuando lo abras.\n";
-        }
-        Sleep(1500);
-
-        // Aplicamos directo lo cargado del archivo al registro y refrescamos el driver
-        AplicarCambios();
-        ReiniciarHID();
-    } 
-    else {
-        // PASO 1 TRADICIONAL (Solo si no hay archivo o si se presionó 1)
-        system("cls");
+    // SI NO SE OMITIÓ, PASAMOS A LA CONFIGURACIÓN MANUAL (PASO 1 y PASO 2)
+    if (!omitirConfiguracion) {
+        // PASO 1: SELECCIÓN DE PROCESO PARA WHITELIST
         auto procesos = ListarProcesosUsuario();
-        std::wcout << L"=== PASO 1: SELECCIONAR PROGRAMA PARA WHITELIST ===\n";
+        std::wcout << L"\n=== PASO 1: SELECCIONAR PROGRAMA PARA WHITELIST ===\n";
         std::wcout << L"Lista de procesos activos (Usuario):\n";
         
         for (size_t i = 0; i < procesos.size(); i++) {
@@ -250,86 +239,107 @@ int main() {
 
         if (selP > 0 && selP <= (int)procesos.size()) {
             g_whitelistPIDs.push_back(procesos[selP - 1].pid);
-            g_exeTarget = procesos[selP - 1].nombre; // Almacenamos el nombre de cara al .cfg
+            g_exeWhitelistNombre = procesos[selP - 1].nombre; // Guardamos el texto ".exe"
             std::wcout << L"\n[OK] " << procesos[selP - 1].nombre << L" (PID " << procesos[selP - 1].pid << L") añadido.\n";
-            Sleep(1000);
+        } else {
+            g_exeWhitelistNombre = L"OMITIDO";
         }
-    }
+        Sleep(1000);
 
-    // PASO 2: BUCLE DE BLOQUEO DE DISPOSITIVOS
-    std::wstring input;
-    while (true) {
-        system("cls");
-        std::wcout << L"=== PASO 2: GESTION DE DISPOSITIVOS (MandoShield) ===\n";
-        std::wcout << L"Ejecuta el programa como administrador para que funcione.\n";
-        if (!g_exeTarget.empty()) {
-            std::wcout << L"Programa Whitelist configurado: " << g_exeTarget << L"\n";
+        // PASO 2: BUCLE DE BLOQUEO DE DISPOSITIVOS
+        std::wstring input;
+        bool primeraConfiguracionHecha = false;
+
+        while (true) {
+            system("cls");
+            std::wcout << L"=== PASO 2: GESTION DE DISPOSITIVOS (MandoShield) ===\n";
+            std::wcout << L"Ejecuta el programa como administrador para que funcione.\n\n";
             
-            // Sincronización en caliente por si abres el juego después de iniciar MandoShield
-            DWORD pidVivo = ObtenerPIDPorNombre(g_exeTarget);
-            if (pidVivo != 0 && (g_whitelistPIDs.empty() || g_whitelistPIDs[0] != pidVivo)) {
-                g_whitelistPIDs.clear();
-                g_whitelistPIDs.push_back(pidVivo);
+            auto mandos = ListarMandos();
+            std::wcout << L"ID | ESTADO   | NOMBRE / HARDWARE ID\n";
+            std::wcout << L"---|----------|------------------------------------\n";
+            for (size_t i = 0; i < mandos.size(); i++) {
+                bool b = std::find(g_bloqueados.begin(), g_bloqueados.end(), mandos[i].hwID) != g_bloqueados.end();
+                std::wcout << i + 1 << L". [" << (b ? L"BLOQUEADO" : L" LIBRE   ") << L"] " << mandos[i].name << L"\n";
+                std::wcout << L"   ID: " << mandos[i].hwID << L"\n\n";
+            }
+
+            std::wcout << L"OPCIONES:\n";
+            std::wcout << L"- Ingrese numeros separados por coma (ejemplo: 1,2) para alternar bloqueo.\n";
+            std::wcout << L"- [0] Salir y desbloquear todo.\n";
+            std::wcout << L"- [S] Guardar configuración actual y continuar en bucle.\n"; // Agregado para flexibilidad
+            std::wcout << L"Seleccion: ";
+            
+            std::wcin >> input;
+
+            if (input == L"0") {
+                g_bloqueados.clear();
                 AplicarCambios();
                 ReiniciarHID();
+                std::wcout << L"Limpiando y saliendo...\n";
+                break;
             }
-        }
-        std::wcout << L"\n";
-        
-        auto mandos = ListarMandos();
-        std::wcout << L"ID | ESTADO   | NOMBRE / HARDWARE ID\n";
-        std::wcout << L"---|----------|------------------------------------\n";
-        for (size_t i = 0; i < mandos.size(); i++) {
-            bool b = std::find(g_bloqueados.begin(), g_bloqueados.end(), mandos[i].hwID) != g_bloqueados.end();
-            std::wcout << i + 1 << L". [" << (b ? L"BLOQUEADO" : L" LIBRE   ") << L"] " << mandos[i].name << L"\n";
-            std::wcout << L"   ID: " << mandos[i].hwID << L"\n\n";
-        }
 
-        std::wcout << L"OPCIONES:\n";
-        std::wcout << L"- Ingrese numeros separados por coma (ejemplo: 1,2) para alternar bloqueo.\n";
-        std::wcout << L"- [0] Salir, DESBLOQUEAR TODO y guardar cambios actuales en el .cfg\n";
-        std::wcout << L"Seleccion: ";
-        
-        std::wcin >> input;
-
-        if (input == L"0") {
-            // Guardamos la configuración en disco justo antes de deshacer los cambios en el sistema
-            GuardarConfiguracionArchivo();
-
-            // Lógica exacta de salida efímera original: limpiar vectores, borrar registro y reiniciar driver
-            g_bloqueados.clear();
-            g_whitelistPIDs.clear();
-            AplicarCambios();
-            ReiniciarHID();
-            std::wcout << L"Limpiando registros del sistema y saliendo de forma limpia...\n";
-            break;
-        }
-
-        // Procesar múltiples selecciones (comas)
-        std::wstringstream ss(input);
-        std::wstring item;
-        while (std::getline(ss, item, L',')) {
-            try {
-                int idx = std::stoi(item);
-                if (idx > 0 && idx <= (int)mandos.size()) {
-                    auto it = std::find(g_bloqueados.begin(), g_bloqueados.end(), mandos[idx - 1].hwID);
-                    if (it != g_bloqueados.end()) {
-                        g_bloqueados.erase(it);
-                    } else {
-                        g_bloqueados.push_back(mandos[idx - 1].hwID);
+            // Procesar múltiples selecciones (comas)
+            std::wstringstream ss(input);
+            std::wstring item;
+            while (std::getline(ss, item, L',')) {
+                try {
+                    int idx = std::stoi(item);
+                    if (idx > 0 && idx <= (int)mandos.size()) {
+                        auto it = std::find(g_bloqueados.begin(), g_bloqueados.end(), mandos[idx - 1].hwID);
+                        if (it != g_bloqueados.end()) {
+                            g_bloqueados.erase(it);
+                        } else {
+                            g_bloqueados.push_back(mandos[idx - 1].hwID);
+                        }
                     }
+                } catch (...) {
+                    // Ignorar entradas que no sean números
                 }
-            } catch (...) {}
-        }
+            }
 
-        if (!AplicarCambios()) {
-            std::wcout << L"\n[!] ERROR: No se pudo escribir en el registro. ¿Eres Administrador?\n";
+            if (!AplicarCambios()) {
+                std::wcout << L"\n[!] ERROR: No se pudo escribir en el registro. ¿Eres Administrador?\n";
+                Sleep(2000);
+            } else {
+                // APENAS SE CONFIGURA CORRECTAMENTE POR PRIMERA VEZ, SE GUARDA AUTOMÁTICAMENTE
+                GuardarConfiguracion();
+            }
+            
+            ReiniciarHID();
+            std::wcout << L"\n[*] Procesando cambios...";
+            Sleep(800);
+        }
+    } else {
+        // SI SE ELIGIÓ EJECUTAR LO GUARDADO (Bucle infinito simulado o interactivo para mantener vivo el bloqueo)
+        std::wstring fin;
+        while (true) {
+            system("cls");
+            std::wcout << L"=== MANDO SHIELD (MODO AUTOMÁTICO ACTIVO) ===\n";
+            std::wcout << L"Ejecutando con la configuración cargada de '" << CONFIG_FILE.c_str() << L"'\n\n";
+            std::wcout << L"Programa Whitelist: " << g_exeWhitelistNombre << L"\n";
+            std::wcout << L"Dispositivos bloqueados en registro: " << g_bloqueados.size() << L"\n\n";
+            std::wcout << L"Presione '0' y Enter para deshacer bloqueos y salir: ";
+            std::wcin >> fin;
+            if (fin == L"0") {
+                g_bloqueados.clear();
+                AplicarCambios();
+                ReiniciarHID();
+                break;
+            }
+            
+            // Actualizar dinámicamente por si abres el juego/programa más tarde
+            if (!g_exeWhitelistNombre.empty() && g_exeWhitelistNombre != L"OMITIDO") {
+                DWORD pidActual = ObtenerPidPorNombre(g_exeWhitelistNombre);
+                if (pidActual != 0 && (g_whitelistPIDs.empty() || g_whitelistPIDs[0] != pidActual)) {
+                    g_whitelistPIDs.clear();
+                    g_whitelistPIDs.push_back(pidActual);
+                    AplicarCambios();
+                }
+            }
             Sleep(2000);
         }
-        
-        ReiniciarHID();
-        std::wcout << L"\n[*] Procesando cambios...";
-        Sleep(800);
     }
 
     return 0;
